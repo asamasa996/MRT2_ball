@@ -1,0 +1,2 @@
+# MRT2_ball
+runpod起動ーHuggingfaceトークン取得ー合言葉入力の自動化
