@@ -96,7 +96,7 @@ async def mrt_ws(websocket: WebSocket):
         _sessions[sid] = {"audio": audio_q, "stop": stop_ev}
     t.start()
     print(f"[mrt] session {sid} started", flush=True)
-    await websocket.send_json({"type": "ready", "session_id": sid})
+    await websocket.send_json({"type": "ready", "session_id": sid, "loaded": list(MODELS.keys())})   # 実際に読み込まれているモデル
     loop = asyncio.get_event_loop()
 
     async def send_audio():
