@@ -5,6 +5,11 @@
 # 【自動運用】RunPod のテンプレートに環境変数 HF_TOKEN / MRT2_KEY を入れ、起動時コマンドでこのファイルを
 #   取得して実行すれば、Pod を起動するだけで最後まで進む (入力なし)。詳しくは runpod/自動起動の設定.md
 #
+# 【small / base の選び方】環境変数 MRT2_SIZE で選ぶ (未設定なら small)。
+#   small = 2.3億パラメーター (重み約1.1GB) … 通常はこちら。GPU は 12GB 以上
+#   base  = 24億パラメーター (重み約9.2GB) … より高品質とされるが重い。1フレームが 40ms に収まるかは実測が必要
+#   RunPod ではテンプレートを 2 つ作り、MRT2_SIZE だけ変える (runpod/自動起動の設定.md)。
+#
 # 使い方 (手動: Jupyter Lab の Terminal で):
 #   1. このファイル (setup.sh) だけを /workspace にドラッグして置く (2回目以降は /workspace に残っているので不要)
 #   2. bash /workspace/setup.sh
@@ -18,6 +23,14 @@
 # 2回目以降 (サーバーを Ctrl+C で止めた後) は bash /workspace/start.sh で起動だけできる。
 # ---------------------------------------------------------------
 set -euo pipefail
+
+SIZE="${MRT2_SIZE:-small}"
+case "$SIZE" in
+  small) SIZE_GB="1.1"; MIN_BYTES=$((1 * 1024 * 1024 * 1024)); MIN_VRAM_MIB=12000 ;;
+  base)  SIZE_GB="9.2"; MIN_BYTES=$((9 * 1024 * 1024 * 1024)); MIN_VRAM_MIB=12000 ;;
+  *) echo "MRT2_SIZE は small か base にしてください (いまの値: $SIZE)"; exit 1 ;;
+esac
+echo "モデルの大きさ: $SIZE"
 
 W=/workspace
 export MAGENTA_HOME=$W/magenta-home
@@ -186,7 +199,13 @@ if [ -n "$CC" ]; then
     echo "今の構成 (PyTorch 2.6 + CUDA 12.4) では動きません。Pod を Terminate して別のGPUにしてください。"; exit 1
   fi
 fi
-echo "${GPU_INFO:-不明}" > "$W/gpu_used.txt"   # どのGPUで試したかの記録用
+VRAM_MIB=$(echo "$GPU_INFO" | awk -F', ' '{print $3}' | tr -dc '0-9')
+if [ -n "$VRAM_MIB" ] && [ "$VRAM_MIB" -lt "$MIN_VRAM_MIB" ]; then
+  echo "このGPUのメモリ (${VRAM_MIB} MiB) では $SIZE を動かせません (${MIN_VRAM_MIB} MiB 以上が必要)。"
+  echo "Pod を Terminate して、メモリの大きいGPUにしてください。"; exit 1
+fi
+echo "${GPU_INFO:-不明} / MRT2_SIZE=$SIZE" > "$W/gpu_used.txt"   # どのGPUで試したかの記録用
+echo "$SIZE" > "$W/.mrt2_size"                                   # start.sh が読む
 
 step 1/6 "コードの取得"
 [ -d mrt-local ] || git clone https://github.com/babakarto/magenta-rt-local-windows mrt-local
@@ -207,8 +226,9 @@ fi
 python -c "import triton, triton.language; from triton.compiler.compiler import triton_key" \
   || { echo "triton が動きません。上のエラーを Claude に見せてください"; exit 1; }
 
-step 3/6 "モデルの重み (約1.1GB)"
-if [ -z "$(ls -A "$MAGENTA_HOME" 2>/dev/null)" ]; then
+step 3/6 "モデルの重み ($SIZE: 約${SIZE_GB}GB)"
+CKPT="$MAGENTA_HOME/magenta-rt-v2/checkpoints/mrt2_${SIZE}.safetensors"
+if [ ! -f "$CKPT" ] || [ "$(stat -c %s "$CKPT")" -lt "$MIN_BYTES" ]; then
   if [ -z "${HF_TOKEN:-}" ]; then
     [ -t 0 ] || { echo "HF_TOKEN が未設定で、入力もできない環境です。RunPod のテンプレートの環境変数に HF_TOKEN を入れてください"; exit 1; }
     echo "Hugging Face のトークンを貼り付けて Enter (画面には表示されません):"
@@ -216,7 +236,7 @@ if [ -z "$(ls -A "$MAGENTA_HOME" 2>/dev/null)" ]; then
   fi
   [ ${#HF_TOKEN} -ge 20 ] || { echo "トークンが短すぎます (${#HF_TOKEN}文字)。もう一度 setup.sh を実行してください"; exit 1; }
   export HF_TOKEN
-  python mrt-local/download_weights.py small --home "$MAGENTA_HOME"
+  python mrt-local/download_weights.py "$SIZE" --home "$MAGENTA_HOME"
   unset HF_TOKEN
 else
   echo "ダウンロード済みなので飛ばします"
@@ -237,6 +257,8 @@ cat > "$W/start.sh" <<'EOS'
 set -eu
 export MAGENTA_HOME=/workspace/magenta-home
 source /workspace/venv/bin/activate
+# モデルの大きさ: ①環境変数 MRT2_SIZE → ②setup.sh が書いた /workspace/.mrt2_size → ③small
+SIZE="${MRT2_SIZE:-$(cat /workspace/.mrt2_size 2>/dev/null || echo small)}"
 # 合言葉の決め方: ①環境変数 MRT2_KEY → ②保存済み /workspace/.mrt2_key → ③入力 (入力したら②に保存)
 KEYFILE=/workspace/.mrt2_key
 if [ -z "${MRT2_KEY:-}" ] && [ -s "$KEYFILE" ]; then
@@ -251,9 +273,10 @@ fi
 export MRT2_KEY
 cd /workspace/jam
 echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)  (記録表に書いておく)"
-echo "起動します。準備運転に 30〜60秒。'mrt2_small ready' が出たら手元から接続してください"
+echo "起動します (モデル: mrt2_$SIZE)。準備運転に 30〜60秒 (base はもっと長い)。'mrt2_$SIZE ready' が出たら手元から接続してください"
+echo "手元の .env に MRT2_MODEL=mrt2_$SIZE と書いておくと、ログに使ったモデルが残ります"
 echo "接続先: wss://${RUNPOD_POD_ID:-<PodのID>}-7860.proxy.runpod.net/mrt"
-MRT_LOAD=small exec python app_local.py
+MRT_LOAD=$SIZE exec python app_local.py
 EOS
 chmod +x "$W/start.sh"
 
